@@ -24,6 +24,7 @@ import glob
 import shutil
 from typing import Optional, Union
 from joblib import Parallel, delayed
+import time
 
 from EGMStoolkit.functions import egmsapitools
 from EGMStoolkit import usermessage
@@ -299,44 +300,82 @@ class egmsdownloader:
 
         total_len = len(self.listL2a) + len(self.listL2b) + len(self.listL3UD) + len(self.listL3EW)
 
+        MAX_RETRIES = 5  # Maximum number of retries for 429
+        BASE_WAIT = 5  # Base wait time in seconds (exponential backoff)
+
         h = 1
         for type in ['L2a', 'L2b', 'L3UD', 'L3EW']:
-            datatmp = eval('self.list%s' % (type))
-            datatmplink = eval('self.list%slink' % (type))
-        
-            if datatmp: 
-                if not os.path.isdir('%s%s%s' % (outputdir,os.sep,type)):
-                    os.mkdir('%s%s%s' % (outputdir,os.sep,type))
+            datatmp = eval('self.list%s' % type)
+            datatmplink = eval('self.list%slink' % type)
 
-                for idx in np.arange(len(datatmp)): 
-                    usermessage.egmstoolkitprint('%d / %d files: Download the file: %s' % (h,total_len,datatmp[idx]),self.log,verbose)
+            if datatmp:
+                type_dir = os.path.join(outputdir, type)
+                if not os.path.isdir(type_dir):
+                    os.mkdir(type_dir)
+
+                for idx in range(len(datatmp)):
+                    usermessage.egmstoolkitprint(
+                        '%d / %d files: Download the file: %s' % (h, total_len, datatmp[idx]),
+                        self.log, verbose
+                    )
 
                     release_para = egmsapitools.check_release_fromfile(datatmp[idx])
+                    pathdir = os.path.join(type_dir, release_para[0])
+                    if not os.path.isdir(pathdir):
+                        os.mkdir(pathdir)
 
-                    if not os.path.isdir('%s%s%s%s%s' % (outputdir,os.sep,type,os.sep,release_para[0])):
-                        os.mkdir('%s%s%s%s%s' % (outputdir,os.sep,type,os.sep,release_para[0]))
-                    pathdir = '%s%s%s%s%s' % (outputdir,os.sep,type,os.sep,release_para[0])
+                    output_file_path = os.path.join(pathdir, datatmplink[idx].split('/')[-1])
 
-                    if not os.path.isfile('%s%s%s' % (pathdir,os.sep,datatmp[idx])): 
-                        if (not ('%s%s%s%s%s%s' % (pathdir,os.sep,datatmp[idx].split('.')[0],os.sep,datatmp[idx].split('.')[0],'.csv'))) or force == True:
+                    # Check if file exists or force download
+                    if not os.path.isfile(output_file_path) or force:
+                        success = False
+                        attempt = 0
 
-                            egmsapitools.download_file('%s?id=%s' % (datatmplink[idx],self.token),
-                                    output_file = pathdir + os.sep + datatmplink[idx].split('/')[-1],
+                        while not success and attempt < MAX_RETRIES:
+                            try:
+                                egmsapitools.download_file(
+                                    '%s?id=%s' % (datatmplink[idx], self.token),
+                                    output_file=output_file_path,
                                     bypass502=True,
-                                    verbose=verbose, 
-                                    log = self.log)
+                                    verbose=verbose,
+                                    log=self.log
+                                )
+                                success = True  # download succeeded
+                            except Exception as e:
+                                # Check if it is a 429 error
+                                if '429' in str(e):
+                                    wait_time = BASE_WAIT * (2 ** attempt)  # exponential backoff
+                                    usermessage.egmstoolkitprint(
+                                        f'429 Too Many Requests, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})',
+                                        self.log, verbose
+                                    )
+                                    time.sleep(wait_time)
+                                    attempt += 1
+                                else:
+                                    raise  # re-raise other exceptions
 
-                        else:
-                            usermessage.egmstoolkitprint('\tAlready downloaded (detection of the .csv file)',self.log,verbose)        
-                    else:                      
-                        usermessage.egmstoolkitprint('\tAlready downloaded (detection of the .zip file)',self.log,verbose)  
+                        if not success:
+                            usermessage.egmstoolkitprint(
+                                f'Failed to download {datatmp[idx]} after {MAX_RETRIES} retries.',
+                                self.log, verbose
+                            )
 
-                    h = h + 1
+                    else:
+                        usermessage.egmstoolkitprint(
+                            '\tAlready downloaded (detection of the .zip file)',
+                            self.log, verbose
+                        )
 
-                    self.unzipfile(outputdir=outputdir,unzipmode=unzipmode,cleanmode=cleanmode,verbose=verbose)
+                    h += 1
+
+                    self.unzipfile(
+                        outputdir=outputdir,
+                        unzipmode=unzipmode,
+                        cleanmode=cleanmode,
+                        verbose=verbose
+                    )
 
         return self
-
     ################################################################################
     ## Function to unzip the files
     ################################################################################
