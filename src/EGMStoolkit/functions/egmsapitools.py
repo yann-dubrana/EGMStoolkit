@@ -19,10 +19,11 @@ Changelog:
 
 from EGMStoolkit import usermessage
 from EGMStoolkit import constants
-import os 
+import os
+import re
 from urllib.parse import urlsplit
 import requests
-import time 
+import time
 from tqdm import tqdm
 
 ################################################################################
@@ -73,17 +74,18 @@ def check_release_fromfile(namefile):
     
     ni = namefile.split('.')
     ni = ni[0].split('VV')
-    
-    if '_2018_2022_1' in ni[-1]: 
+    part = ni[-1]
+
+    if re.search(r'_2018_2022_\d+', part):
         inputrelease = '2018_2022'
         ext_release = '_2018_2022_1'
-    elif '_2019_2023_1' in ni[-1]: 
+    elif re.search(r'_2019_2023_\d+', part):
         inputrelease = '2019_2023'
         ext_release = '_2019_2023_1'
-    else: 
+    else:
         inputrelease = '2015_2021'
         ext_release = ''
-    
+
     release_para = [inputrelease, ext_release]
 
     return release_para
