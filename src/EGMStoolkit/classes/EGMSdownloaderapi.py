@@ -86,7 +86,7 @@ class _RateLimiter:
 
 
 def _download_one_file(work_item, log, verbose_worker, rate_limiter=None,
-                       max_retries=10, retry_wait=5, progress=None):
+                       max_retries=4, retry_wait=5, progress=None):
     """Download a single EGMS file with shared rate-limit awareness.
 
     Args:
