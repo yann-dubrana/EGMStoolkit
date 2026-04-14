@@ -69,7 +69,7 @@ def main():
         parser.add_option("-r", "--release", dest="release", action="store", type="string", default='2019_2023',
                         help="Selected releases of EGMS data: [2015_2021,2018_2022,2019_2023. Default: [2019_2023]. The comma can be used for multiple selections.")  
         parser.add_option("-t", "--token", dest="token", action="store", type="string", default='XXXXXXXXX',
-                        help="User token given by EGMS website.")
+                        help="User token(s) given by EGMS website. Comma-separated for multiple tokens (e.g., TOKEN1,TOKEN2). Each download worker uses one token.")
         parser.add_option("-b", "--bbox", dest="bbox", action="store", type="string", default='None',
                         help="BBOX [WSEN] or country indices or shapefile in EPGS:4326.")
         parser.add_option("-o", "--outputdir", dest="outputdir", action="store", type="string", default='Output',
@@ -86,6 +86,8 @@ def main():
                         help="Block unziping of files. Default: False")
         parser.add_option("--unzipworker", dest="unzipworker", action="store", type="int", default='1',
                         help="Number of worker for file unzipping. Default: 1")
+        parser.add_option("--downloadworker", dest="downloadworker", action="store", type="int", default=1,
+                        help="Number of workers for parallel downloading (1-8). Default: 1")
         parser.add_option("--nozip", dest="nokeepzip", action="store_false", default=True,
                         help="We will remove .zip files. Default: False")
         parser.add_option("--nomerging", dest="merging", action="store_false", default=True,
@@ -120,7 +122,8 @@ def main():
         # Wrapper
         ###########################################################################
 
-        if options.token == 'XXXXXXXXX':
+        token_list = [t.strip() for t in options.token.split(',')]
+        if all(t == 'XXXXXXXXX' for t in token_list):
             raise ValueError(usermessage.errormsg(__name__,__name__,__file__,constants.__copyright__,'The token parameter is not correct.',None))
 
         if options.logmode:
@@ -307,12 +310,12 @@ def main():
         ###########################################################################
         # (3) Download the EGMS data
 
-        # Change the user token 
-        downloadpara.token = options.token
+        # Set user token(s) — supports comma-separated list for parallel workers
+        downloadpara.tokens = [t.strip() for t in options.token.split(',')]
 
         # Download (and unzip) the files
-        if options.download: 
-            downloadpara.download(outputdir=options.outputdir,unzipmode=False,cleanmode=False) 
+        if options.download:
+            downloadpara.download(outputdir=options.outputdir,unzipmode=False,cleanmode=False,nbworker=options.downloadworker)
 
         # Unzip the files
         if options.download and options.unzip:

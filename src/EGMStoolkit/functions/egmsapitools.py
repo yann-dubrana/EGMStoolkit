@@ -91,11 +91,12 @@ def check_release_fromfile(namefile):
 ################################################################################
 ## Function to download a file
 ################################################################################
-def download_file(url, 
+def download_file(url,
     username = None,
     password = None,
     output_file=None,
     retries=10,
+    retry_wait=5,
     bypass502=False,
     verbose=True,
     log=None):
@@ -178,7 +179,17 @@ def download_file(url,
             usermessage.egmstoolkitprint(f"Read timeout on attempt {attempt}/{retries}. Retrying...",log,verbose)
             time.sleep(1)
         except requests.exceptions.HTTPError as errh:
-            raise ValueError('EGMS-toolkit - Downloader - HTTP Error: %s' % (errh),log)
+            if errh.response is not None and errh.response.status_code == 429:
+                attempt += 1
+                wait_time = retry_wait * (2 ** (attempt - 1))
+                usermessage.egmstoolkitprint(
+                    f'EGMS-toolkit - Downloader - 429 Too Many Requests. '
+                    f'Retrying in {wait_time}s (attempt {attempt}/{retries})',
+                    log, verbose
+                )
+                time.sleep(wait_time)
+            else:
+                raise ValueError('EGMS-toolkit - Downloader - HTTP Error: %s' % (errh), log)
         except requests.exceptions.ConnectionError as errc:
             attempt += 1
             usermessage.egmstoolkitprint(f"Read timeout on attempt {attempt}/{retries}. Retrying...",log,verbose)

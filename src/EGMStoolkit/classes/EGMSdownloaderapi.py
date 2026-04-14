@@ -31,6 +31,28 @@ from EGMStoolkit import usermessage
 from EGMStoolkit import constants
 
 ################################################################################
+## Module-level helper for parallel downloads
+################################################################################
+def _download_one_file(work_item, log, verbose_worker):
+    """Download a single EGMS file.
+
+    Returns:
+        tuple: (filename_label, success, error_msg)
+    """
+    url_base, output_file_path, filename_label, token = work_item
+    try:
+        egmsapitools.download_file(
+            '%s?id=%s' % (url_base, token),
+            output_file=output_file_path,
+            bypass502=True,
+            verbose=verbose_worker,
+            log=log
+        )
+        return (filename_label, True, None)
+    except Exception as e:
+        return (filename_label, False, str(e))
+
+################################################################################
 ## Creation of a class to manage the Sentinel-1 burst ID map
 ################################################################################
 class egmsdownloader:
@@ -95,12 +117,30 @@ class egmsdownloader:
         self.listL3UDlink = listL3UDlink
         self.listL3EW = listL3EW
         self.listL3EWlink = listL3EWlink
-        self.token = token
-       
+
+        if isinstance(token, list):
+            self.tokens = [str(t).strip() for t in token]
+        elif isinstance(token, str) and ',' in token:
+            self.tokens = [t.strip() for t in token.split(',')]
+        else:
+            self.tokens = [str(token).strip()]
+
         self.verbose = verbose
         self.log = log
 
         self.checkparameter(verbose=False)
+
+    @property
+    def token(self):
+        """First token (backward compatibility)."""
+        return self.tokens[0] if self.tokens else 'XXXXXXX--XXXXXXX'
+
+    @token.setter
+    def token(self, value):
+        if isinstance(value, list):
+            self.tokens = [str(v).strip() for v in value]
+        else:
+            self.tokens = [str(value).strip()]
 
     ################################################################################
     ## Check parameters
@@ -125,8 +165,10 @@ class egmsdownloader:
         
         usermessage.openingmsg(__name__,'checkparameter',__file__,constants.__copyright__,'Check the parameter',self.log,verbose)
 
-        if (self.token == 'XXXXXXX--XXXXXXX'):
-            usermessage.warningmsg(__name__,'checkparameter',__file__,'The user token is not correct.',self.log,True)
+        for tok in self.tokens:
+            if tok == 'XXXXXXX--XXXXXXX':
+                usermessage.warningmsg(__name__,'checkparameter',__file__,'One or more user tokens are not correct.',self.log,True)
+                break
 
     ################################################################################
     ## Function to print the attributes
@@ -265,115 +307,109 @@ class egmsdownloader:
     ## Function to download the files
     ################################################################################
     def download(self,
-        outputdir: Optional[str] = '.%sOutput' % (os.sep),    
+        outputdir: Optional[str] = '.%sOutput' % (os.sep),
         unzipmode: Optional[bool] = False,
         cleanmode: Optional[bool] = False,
         force: Optional[bool] = True,
+        nbworker: Optional[int] = 1,
         verbose: Optional[Union[bool,None]] = None):
         """Download the EGMS files
-        
+
         Args:
 
             outputdir (str, Optional): Path of the output directory [Default: './Output']
             unzipmode (bool, Optional): Unzip the file [Default: `False`]
             cleanmode (bool, Optional): Delete the file after unzipping [Default: `False`]
             force (bool, Optional): Replace the stored file [Default: `True`]
+            nbworker (int, Optional): Number of parallel download workers, 1–8 [Default: 1]
             verbose (bool or None, Optional): Verbose if `None`, use the verbose mode of the job [Default: `None`]
 
         Return
 
             `egmsdownloader` class
 
-        """ 
+        """
 
         if verbose == None:
             verbose = self.verbose
-        if not isinstance(verbose,bool):
+        if not isinstance(verbose, bool):
             raise ValueError(usermessage.errormsg(__name__,'download',__file__,constants.__copyright__,'Verbose must be True or False',self.log))
-        
-        self.checkparameter(verbose = False)
+
+        if not isinstance(nbworker, int) or nbworker < 1 or nbworker > 8:
+            raise ValueError(usermessage.errormsg(__name__,'download',__file__,constants.__copyright__,'nbworker must be an integer between 1 and 8.',self.log))
+
+        self.checkparameter(verbose=False)
 
         usermessage.openingmsg(__name__,__name__,__file__,constants.__copyright__,'Download the EGMS files',self.log,verbose)
 
-        if not os.path.isdir(outputdir): 
-            os.mkdir(outputdir)
+        os.makedirs(outputdir, exist_ok=True)
 
-        total_len = len(self.listL2a) + len(self.listL2b) + len(self.listL3UD) + len(self.listL3EW)
-
-        MAX_RETRIES = 5  # Maximum number of retries for 429
-        BASE_WAIT = 5  # Base wait time in seconds (exponential backoff)
-
-        h = 1
-        for type in ['L2a', 'L2b', 'L3UD', 'L3EW']:
-            datatmp = eval('self.list%s' % type)
-            datatmplink = eval('self.list%slink' % type)
-
+        # Phase 1: pre-create all directories to avoid race conditions in parallel mode
+        for type_label in ['L2a', 'L2b', 'L3UD', 'L3EW']:
+            datatmp = getattr(self, 'list%s' % type_label)
             if datatmp:
-                type_dir = os.path.join(outputdir, type)
-                if not os.path.isdir(type_dir):
-                    os.mkdir(type_dir)
-
-                for idx in range(len(datatmp)):
-                    usermessage.egmstoolkitprint(
-                        '%d / %d files: Download the file: %s' % (h, total_len, datatmp[idx]),
-                        self.log, verbose
-                    )
-
-                    release_para = egmsapitools.check_release_fromfile(datatmp[idx])
+                type_dir = os.path.join(outputdir, type_label)
+                os.makedirs(type_dir, exist_ok=True)
+                for filename in datatmp:
+                    release_para = egmsapitools.check_release_fromfile(filename)
                     pathdir = os.path.join(type_dir, release_para[0])
-                    if not os.path.isdir(pathdir):
-                        os.mkdir(pathdir)
+                    os.makedirs(pathdir, exist_ok=True)
 
-                    output_file_path = os.path.join(pathdir, datatmplink[idx].split('/')[-1])
-
-                    # Check if file exists or force download
-                    if not os.path.isfile(output_file_path) or force:
-                        success = False
-                        attempt = 0
-
-                        while not success and attempt < MAX_RETRIES:
-                            try:
-                                egmsapitools.download_file(
-                                    '%s?id=%s' % (datatmplink[idx], self.token),
-                                    output_file=output_file_path,
-                                    bypass502=True,
-                                    verbose=verbose,
-                                    log=self.log
-                                )
-                                success = True  # download succeeded
-                            except Exception as e:
-                                # Check if it is a 429 error
-                                if '429' in str(e):
-                                    wait_time = BASE_WAIT * (2 ** attempt)  # exponential backoff
-                                    usermessage.egmstoolkitprint(
-                                        f'429 Too Many Requests, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})',
-                                        self.log, verbose
-                                    )
-                                    time.sleep(wait_time)
-                                    attempt += 1
-                                else:
-                                    raise  # re-raise other exceptions
-
-                        if not success:
-                            usermessage.egmstoolkitprint(
-                                f'Failed to download {datatmp[idx]} after {MAX_RETRIES} retries.',
-                                self.log, verbose
-                            )
-
+        # Phase 2: build flat work list with round-robin token assignment
+        work_items = []
+        for type_label in ['L2a', 'L2b', 'L3UD', 'L3EW']:
+            datatmp = getattr(self, 'list%s' % type_label)
+            datatmplink = getattr(self, 'list%slink' % type_label)
+            if datatmp:
+                type_dir = os.path.join(outputdir, type_label)
+                for filename, link in zip(datatmp, datatmplink):
+                    release_para = egmsapitools.check_release_fromfile(filename)
+                    pathdir = os.path.join(type_dir, release_para[0])
+                    out_path = os.path.join(pathdir, link.split('/')[-1])
+                    if not os.path.isfile(out_path) or force:
+                        token = self.tokens[len(work_items) % len(self.tokens)]
+                        work_items.append((link, out_path, filename, token))
                     else:
                         usermessage.egmstoolkitprint(
-                            '\tAlready downloaded (detection of the .zip file)',
+                            '\tAlready downloaded (detection of the .zip file): %s' % filename,
                             self.log, verbose
                         )
 
-                    h += 1
+        # Phase 3: dispatch downloads (sequential or parallel)
+        total_len = len(work_items)
+        verbose_worker = verbose if nbworker == 1 else False
 
-                    self.unzipfile(
-                        outputdir=outputdir,
-                        unzipmode=unzipmode,
-                        cleanmode=cleanmode,
-                        verbose=verbose
-                    )
+        if nbworker == 1:
+            results = []
+            for h, item in enumerate(work_items, 1):
+                usermessage.egmstoolkitprint(
+                    '%d / %d files: Download the file: %s' % (h, total_len, item[2]),
+                    self.log, verbose
+                )
+                results.append(_download_one_file(item, self.log, verbose_worker))
+        else:
+            usermessage.egmstoolkitprint(
+                'Downloading %d files with %d workers (%d token(s))' % (total_len, nbworker, len(self.tokens)),
+                self.log, verbose
+            )
+            results = Parallel(n_jobs=nbworker, backend='threading')(
+                delayed(_download_one_file)(item, self.log, False)
+                for item in work_items
+            )
+
+        for filename_label, success, error_msg in results:
+            if not success:
+                usermessage.egmstoolkitprint(
+                    'Failed to download %s: %s' % (filename_label, error_msg),
+                    self.log, verbose
+                )
+
+        self.unzipfile(
+            outputdir=outputdir,
+            unzipmode=unzipmode,
+            cleanmode=cleanmode,
+            verbose=verbose
+        )
 
         return self
     ################################################################################
