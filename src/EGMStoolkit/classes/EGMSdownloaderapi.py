@@ -33,19 +33,67 @@ from EGMStoolkit import usermessage
 from EGMStoolkit import constants
 
 ################################################################################
-## Module-level helper for parallel downloads
+## Module-level helpers for parallel downloads
 ################################################################################
-def _download_one_file(work_item, log, verbose_worker, rate_limit_event=None,
-                       max_retries=10, retry_wait=5):
+class _ProgressCounter:
+    """Thread-safe counter that prints progress from parallel workers."""
+
+    def __init__(self, total, log):
+        self._lock = threading.Lock()
+        self._done = 0
+        self.total = total
+        self.log = log
+
+    def increment(self, filename_label, status_char):
+        """Increment and print one progress line.
+
+        status_char: '+' = downloaded, '=' = already done, 'x' = failed/skipped
+        """
+        with self._lock:
+            self._done += 1
+            done = self._done
+        usermessage.egmstoolkitprint(
+            '[%s] %d / %d : %s' % (status_char, done, self.total, filename_label),
+            self.log, True
+        )
+
+
+class _RateLimiter:
+    """Shared cooldown timer across parallel workers.
+
+    When any worker hits 429/502, it records a cooldown deadline.
+    All workers check this before firing a request and sleep until
+    the deadline passes. No blocking Event — just a shared timestamp
+    protected by a lock.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._resume_at = 0.0  # epoch seconds
+
+    def signal(self, wait_seconds):
+        """Record that requests should pause for wait_seconds from now."""
+        deadline = time.monotonic() + wait_seconds
+        with self._lock:
+            if deadline > self._resume_at:
+                self._resume_at = deadline
+
+    def wait_if_needed(self):
+        """Sleep until the cooldown deadline, if any."""
+        with self._lock:
+            remaining = self._resume_at - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+
+
+def _download_one_file(work_item, log, verbose_worker, rate_limiter=None,
+                       max_retries=10, retry_wait=5, progress=None):
     """Download a single EGMS file with shared rate-limit awareness.
 
     Args:
         work_item: tuple (url_base, output_file_path, filename_label, token)
         log: log path
         verbose_worker: verbose flag
-        rate_limit_event (threading.Event, optional): shared pause signal.
-            Any worker that hits 429/502 sets this; all workers wait for it
-            to clear before their next attempt.
+        rate_limiter (_RateLimiter, optional): shared cooldown coordinator.
         max_retries: maximum attempts before giving up
         retry_wait: base wait seconds for exponential backoff
 
@@ -56,19 +104,15 @@ def _download_one_file(work_item, log, verbose_worker, rate_limit_event=None,
     url = '%s?id=%s' % (url_base, token)
 
     for attempt in range(max_retries):
-        # Wait if another worker signalled rate-limiting
-        if rate_limit_event is not None and rate_limit_event.is_set():
-            usermessage.egmstoolkitprint(
-                'Rate-limit pause active, waiting before retrying %s' % filename_label,
-                log, verbose_worker
-            )
-            rate_limit_event.wait()  # blocks until cleared
+        # Honour any global cooldown set by another worker
+        if rate_limiter is not None:
+            rate_limiter.wait_if_needed()
 
+        existing_size = os.path.getsize(output_file_path) if os.path.exists(output_file_path) else 0
         try:
             response = requests.get(
                 url,
-                headers={'Range': 'bytes=%d-' % (os.path.getsize(output_file_path)
-                                                   if os.path.exists(output_file_path) else 0)},
+                headers={'Range': 'bytes=%d-' % existing_size},
                 stream=True,
                 allow_redirects=True,
                 timeout=(5, 5)
@@ -78,38 +122,41 @@ def _download_one_file(work_item, log, verbose_worker, rate_limit_event=None,
                 'Connection error on %s (attempt %d/%d): %s' % (filename_label, attempt + 1, max_retries, e),
                 log, verbose_worker
             )
-            time.sleep(min(retry_wait * (2 ** attempt), 60))
+            wait_time = min(retry_wait * (2 ** attempt), 60)
+            if rate_limiter is not None:
+                rate_limiter.signal(wait_time)
+            else:
+                time.sleep(wait_time)
             continue
 
         status = response.status_code
 
         if status in (429, 502):
-            wait_time = retry_wait * (2 ** attempt)
+            wait_time = min(retry_wait * (2 ** attempt), 300)
             label = '429 Too Many Requests' if status == 429 else '502 Bad Gateway'
             usermessage.egmstoolkitprint(
-                'EGMS-toolkit - Downloader - %s on %s. Retrying in %ds (attempt %d/%d)' % (
+                'EGMS-toolkit - Downloader - %s on %s. Cooling down %ds (attempt %d/%d)' % (
                     label, filename_label, wait_time, attempt + 1, max_retries),
                 log, verbose_worker
             )
-            if rate_limit_event is not None:
-                rate_limit_event.set()
-            time.sleep(wait_time)
-            if rate_limit_event is not None:
-                rate_limit_event.clear()
+            if rate_limiter is not None:
+                rate_limiter.signal(wait_time)
+                rate_limiter.wait_if_needed()
+            else:
+                time.sleep(wait_time)
             continue
 
         if status == 416:
-            # File already fully downloaded
-            usermessage.egmstoolkitprint(
-                'EGMS-Toolkit - Downloader - Already complete: %s' % filename_label, log, verbose_worker
-            )
+            if progress is not None:
+                progress.increment(filename_label, '=')
             return (filename_label, True, None)
 
         if status != 200 and status != 206:
+            if progress is not None:
+                progress.increment(filename_label, 'x')
             return (filename_label, False, 'HTTP %d on %s' % (status, filename_label))
 
         # Stream to disk
-        existing_size = os.path.getsize(output_file_path) if os.path.exists(output_file_path) else 0
         mode = 'ab' if existing_size > 0 else 'wb'
         try:
             with open(output_file_path, mode) as f:
@@ -117,16 +164,20 @@ def _download_one_file(work_item, log, verbose_worker, rate_limit_event=None,
                     if chunk:
                         f.write(chunk)
         except Exception as e:
+            if progress is not None:
+                progress.increment(filename_label, 'x')
             return (filename_label, False, 'Write error: %s' % e)
 
-        usermessage.egmstoolkitprint(
-            'EGMS-toolkit - Downloader - Download complete: %s' % filename_label, log, verbose_worker
-        )
+        if progress is not None:
+            progress.increment(filename_label, '+')
         return (filename_label, True, None)
 
-    # Exhausted retries — check if the file was never written (truly missing)
     if not os.path.isfile(output_file_path):
+        if progress is not None:
+            progress.increment(filename_label, 'x')
         return (filename_label, False, 'file not available on server after %d attempts' % max_retries)
+    if progress is not None:
+        progress.increment(filename_label, 'x')
     return (filename_label, False, 'max retries (%d) exceeded' % max_retries)
 
 ################################################################################
@@ -456,8 +507,8 @@ class egmsdownloader:
         total_len = len(work_items)
         verbose_worker = verbose if nbworker == 1 else False
 
-        # Shared event: any worker that hits 429/502 sets this to pause all workers
-        rate_limit_event = threading.Event()
+        rate_limiter = _RateLimiter()
+        progress = _ProgressCounter(total_len, self.log)
 
         if nbworker == 1:
             results = []
@@ -467,7 +518,8 @@ class egmsdownloader:
                     self.log, verbose
                 )
                 results.append(_download_one_file(item, self.log, verbose_worker,
-                                                   rate_limit_event=rate_limit_event))
+                                                   rate_limiter=rate_limiter,
+                                                   progress=None))  # sequential: header line is enough
         else:
             usermessage.egmstoolkitprint(
                 'Downloading %d files with %d workers (%d token(s))' % (total_len, nbworker, len(self.tokens)),
@@ -475,7 +527,8 @@ class egmsdownloader:
             )
             results = Parallel(n_jobs=nbworker, backend='threading')(
                 delayed(_download_one_file)(item, self.log, False,
-                                            rate_limit_event=rate_limit_event)
+                                            rate_limiter=rate_limiter,
+                                            progress=progress)
                 for item in work_items
             )
 
