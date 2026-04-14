@@ -27,6 +27,7 @@ from joblib import Parallel, delayed
 import time
 import threading
 import requests
+import re
 
 from EGMStoolkit.functions import egmsapitools
 from EGMStoolkit import usermessage
@@ -85,26 +86,16 @@ class _RateLimiter:
             time.sleep(remaining)
 
 
-def _download_one_file(work_item, log, verbose_worker, rate_limiter=None,
-                       max_retries=4, retry_wait=5, progress=None):
-    """Download a single EGMS file with shared rate-limit awareness.
-
-    Args:
-        work_item: tuple (url_base, output_file_path, filename_label, token)
-        log: log path
-        verbose_worker: verbose flag
-        rate_limiter (_RateLimiter, optional): shared cooldown coordinator.
-        max_retries: maximum attempts before giving up
-        retry_wait: base wait seconds for exponential backoff
+def _try_url(url, output_file_path, rate_limiter, log, verbose_worker, max_retries, retry_wait):
+    """Attempt to download one URL with retry logic.
 
     Returns:
-        tuple: (filename_label, success, error_msg)
+        'ok'       — file written successfully
+        'exists'   — 416, already complete
+        'ratelimit'— exhausted retries on 429/502
+        'error'    — non-retryable HTTP error
     """
-    url_base, output_file_path, filename_label, token = work_item
-    url = '%s?id=%s' % (url_base, token)
-
     for attempt in range(max_retries):
-        # Honour any global cooldown set by another worker
         if rate_limiter is not None:
             rate_limiter.wait_if_needed()
 
@@ -119,7 +110,7 @@ def _download_one_file(work_item, log, verbose_worker, rate_limiter=None,
             )
         except Exception as e:
             usermessage.egmstoolkitprint(
-                'Connection error on %s (attempt %d/%d): %s' % (filename_label, attempt + 1, max_retries, e),
+                'Connection error (attempt %d/%d): %s' % (attempt + 1, max_retries, e),
                 log, verbose_worker
             )
             wait_time = min(retry_wait * (2 ** attempt), 60)
@@ -131,12 +122,15 @@ def _download_one_file(work_item, log, verbose_worker, rate_limiter=None,
 
         status = response.status_code
 
+        if status == 416:
+            return 'exists'
+
         if status in (429, 502):
             wait_time = min(retry_wait * (2 ** attempt), 300)
             label = '429 Too Many Requests' if status == 429 else '502 Bad Gateway'
             usermessage.egmstoolkitprint(
-                'EGMS-toolkit - Downloader - %s on %s. Cooling down %ds (attempt %d/%d)' % (
-                    label, filename_label, wait_time, attempt + 1, max_retries),
+                'EGMS-toolkit - Downloader - %s. Cooling down %ds (attempt %d/%d)' % (
+                    label, wait_time, attempt + 1, max_retries),
                 log, verbose_worker
             )
             if rate_limiter is not None:
@@ -146,39 +140,94 @@ def _download_one_file(work_item, log, verbose_worker, rate_limiter=None,
                 time.sleep(wait_time)
             continue
 
-        if status == 416:
-            if progress is not None:
-                progress.increment(filename_label, '=')
-            return (filename_label, True, None)
+        if status not in (200, 206):
+            return 'error'
 
-        if status != 200 and status != 206:
-            if progress is not None:
-                progress.increment(filename_label, 'x')
-            return (filename_label, False, 'HTTP %d on %s' % (status, filename_label))
-
-        # Stream to disk
         mode = 'ab' if existing_size > 0 else 'wb'
-        try:
-            with open(output_file_path, mode) as f:
-                for chunk in response.iter_content(chunk_size=constants.__chunksize__):
-                    if chunk:
-                        f.write(chunk)
-        except Exception as e:
+        with open(output_file_path, mode) as f:
+            for chunk in response.iter_content(chunk_size=constants.__chunksize__):
+                if chunk:
+                    f.write(chunk)
+        return 'ok'
+
+    return 'ratelimit'
+
+
+def _download_one_file(work_item, log, verbose_worker, rate_limiter=None,
+                       max_retries=4, retry_wait=5, progress=None):
+    """Download a single EGMS file with shared rate-limit awareness.
+    If the primary URL fails with 502/ratelimit (file not found), alternate
+    version suffixes _2 through _9 are tried (2 attempts each).
+
+    Args:
+        work_item: tuple (url_base, output_file_path, filename_label, token)
+
+    Returns:
+        tuple: (filename_label, success, error_msg)
+    """
+    url_base, output_file_path, filename_label, token = work_item
+
+    def make_url(base, tok):
+        return '%s?id=%s' % (base, tok)
+
+    # Build candidate URL list: primary first, then _2.._9 variants
+    def alternate_urls(base_url):
+        """Yield (url, label) for primary and version-suffix alternates."""
+        yield base_url, filename_label
+        # Replace trailing version digit before .zip: _2019_2023_1.zip → _2019_2023_2.zip
+        for v in range(2, 10):
+            alt = re.sub(r'(_\d+)\.zip$', '_%d.zip' % v, base_url)
+            if alt != base_url:
+                alt_label = re.sub(r'(_\d+)\.zip$', '_%d.zip' % v, filename_label)
+                yield alt, alt_label
+            else:
+                break   # filename has no version suffix to vary
+
+    for url_base_candidate, label_candidate in alternate_urls(url_base):
+        full_url = make_url(url_base_candidate, token)
+        usermessage.egmstoolkitprint(
+            'EGMS-toolkit - Downloader - Trying: %s' % label_candidate,
+            log, verbose_worker
+        )
+        result = _try_url(full_url, output_file_path, rate_limiter,
+                          log, verbose_worker, max_retries, retry_wait)
+
+        if result == 'ok':
+            usermessage.egmstoolkitprint(
+                'EGMS-toolkit - Downloader - Download complete: %s' % label_candidate,
+                log, verbose_worker
+            )
             if progress is not None:
-                progress.increment(filename_label, 'x')
-            return (filename_label, False, 'Write error: %s' % e)
+                progress.increment(label_candidate, '+')
+            return (label_candidate, True, None)
 
-        if progress is not None:
-            progress.increment(filename_label, '+')
-        return (filename_label, True, None)
+        if result == 'exists':
+            if progress is not None:
+                progress.increment(label_candidate, '=')
+            return (label_candidate, True, None)
 
+        if result == 'error':
+            # Non-retryable HTTP error — stop trying alternates
+            if progress is not None:
+                progress.increment(label_candidate, 'x')
+            return (label_candidate, False, 'HTTP error on %s' % label_candidate)
+
+        # result == 'ratelimit' → 502/429 exhausted → try next suffix
+        usermessage.egmstoolkitprint(
+            'EGMS-toolkit - Downloader - Not found: %s, trying next suffix...' % label_candidate,
+            log, verbose_worker
+        )
+
+    # All suffixes exhausted
     if not os.path.isfile(output_file_path):
         if progress is not None:
             progress.increment(filename_label, 'x')
-        return (filename_label, False, 'file not available on server after %d attempts' % max_retries)
+        return (filename_label, False, 'file not available on server after trying all suffixes')
     if progress is not None:
         progress.increment(filename_label, 'x')
-    return (filename_label, False, 'max retries (%d) exceeded' % max_retries)
+    return (filename_label, False, 'max retries exceeded')
+
+
 
 ################################################################################
 ## Creation of a class to manage the Sentinel-1 burst ID map
@@ -255,6 +304,9 @@ class egmsdownloader:
 
         self.verbose = verbose
         self.log = log
+        self.missing = []
+        self.failed = []
+        self.downloaded = []
 
         self.checkparameter(verbose=False)
 
@@ -534,6 +586,7 @@ class egmsdownloader:
 
         not_available = []
         failed = []
+        downloaded = []
         for filename_label, success, error_msg in results:
             if not success:
                 if error_msg and 'not available on server' in error_msg:
@@ -548,6 +601,8 @@ class egmsdownloader:
                         'Failed to download %s: %s' % (filename_label, error_msg),
                         self.log, verbose
                     )
+            else:
+                downloaded.append(filename_label)
 
         if not_available:
             usermessage.egmstoolkitprint(
@@ -559,6 +614,11 @@ class egmsdownloader:
                 '%d file(s) failed to download (check log for details): %s' % (len(failed), ', '.join(failed)),
                 self.log, verbose
             )
+
+        # Store for post-download map
+        self.missing = not_available
+        self.failed = failed
+        self.downloaded = downloaded
 
         self.unzipfile(
             outputdir=outputdir,
@@ -634,11 +694,11 @@ class egmsdownloader:
         ####################
 
         if unzipmode:
-            if nbworker == 1: 
+            if nbworker == 1:
                 h = 1
-                for fi in list_files: 
+                for fi in list_files:
                     unziponefile(fi,cleanmode,h)
-                    h =+ 1
+                    h += 1
             else: 
                 usermessage.egmstoolkitprint('Unzipping with %s workers' % (nbworker),self.log,verbose)  
                 Parallel(n_jobs=nbworker)(delayed(unziponefile)(fi,cleanmode,None) for fi in list_files)

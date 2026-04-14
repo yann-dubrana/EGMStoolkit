@@ -316,6 +316,13 @@ def main():
         # Download (and unzip) the files
         if options.download:
             downloadpara.download(outputdir=options.outputdir,unzipmode=False,cleanmode=False,nbworker=options.downloadworker)
+            if downloadpara.missing or downloadpara.failed or downloadpara.downloaded:
+                ROIpara.displaymap(
+                    output='%s%sfig_missing.jpg' % (options.outputdir, os.sep),
+                    downloaded_files=downloadpara.downloaded,
+                    missing_files=downloadpara.missing,
+                    failed_files=downloadpara.failed
+                )
 
         # Unzip the files
         if options.download and options.unzip:

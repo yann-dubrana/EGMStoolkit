@@ -509,9 +509,12 @@ class S1ROIparameter:
     ################################################################################
     def displaymap(self,
         output: Optional[Union[str,None]] = None,
-        use_folium: Optional[bool] = True,  
-        # unlockfoliumtiles: Optional[bool] = constants.__unlockfoliumtiles__, 
-        verbose: Optional[Union[bool,None]] = None): 
+        use_folium: Optional[bool] = True,
+        downloaded_files: Optional[list] = None,
+        missing_files: Optional[list] = None,
+        failed_files: Optional[list] = None,
+        # unlockfoliumtiles: Optional[bool] = constants.__unlockfoliumtiles__,
+        verbose: Optional[Union[bool,None]] = None):
         """Create a map of the burst IDs
         
         Args:
@@ -711,6 +714,164 @@ class S1ROIparameter:
                         hovertemplate='ROI', 
                         name='ROI'))
         
+        # Helper: decode E{a}N{b} filename → EPSG:4326 polygon corners
+        # E=northing index, N=easting index (EGMS naming convention)
+        def _tile_latlon(fname):
+            import re
+            m_coord = re.search(r'E(\d+)N(\d+)', fname)
+            if not m_coord:
+                return None, None
+            northing_idx = int(m_coord.group(1))
+            easting_idx  = int(m_coord.group(2))
+            x0 = easting_idx  * 100000
+            y0 = northing_idx * 100000
+            xs = [x0, x0+100000, x0+100000, x0, x0]
+            ys = [y0, y0, y0+100000, y0+100000, y0]
+            lats, lons = meter_to_latlon.transform(xs, ys)
+            # meter_to_latlon returns arrays when given arrays
+            return list(lats), list(lons)
+
+        # Label: short tile code extracted from filename
+        def _tile_label(fname):
+            import re
+            m = re.search(r'(E\d+N\d+)', fname)
+            return m.group(1) if m else fname
+
+        # Plot downloaded tiles (green)
+        if downloaded_files:
+            if use_folium:
+                groupDownloaded = folium.FeatureGroup(name='<b>Downloaded tiles</b>')
+
+            for fname in downloaded_files:
+                lats, lons = _tile_latlon(fname)
+                if lats is None:
+                    continue
+                label = _tile_label(fname)
+
+                if use_folium:
+                    folium.Polygon(
+                        locations=list(zip(lats, lons)),
+                        color='green',
+                        fill=True,
+                        fill_color='green',
+                        fill_opacity=0.25,
+                        weight=2,
+                        tooltip=label,
+                        popup=folium.Popup(fname)
+                    ).add_to(groupDownloaded)
+                    folium.Marker(
+                        location=[sum(lats[:-1])/4, sum(lons[:-1])/4],
+                        icon=folium.DivIcon(
+                            html='<div style="font-size:9px;color:green;font-weight:bold;white-space:nowrap">%s</div>' % label,
+                            icon_size=(80, 20),
+                            icon_anchor=(40, 10)
+                        )
+                    ).add_to(groupDownloaded)
+                else:
+                    fig.add_trace(go.Scattermapbox(
+                        mode='lines',
+                        fill='toself',
+                        fillcolor='rgba(0,180,0,0.25)',
+                        line=dict(color='green'),
+                        showlegend=False,
+                        lon=lons + [lons[0]],
+                        lat=lats + [lats[0]],
+                        hovertemplate=fname,
+                        name=label))
+
+            if use_folium:
+                groupDownloaded.add_to(m)
+
+        # Plot missing tiles (grey)
+        if missing_files:
+            if use_folium:
+                groupMissing = folium.FeatureGroup(name='<b>Missing tiles (not on server)</b>')
+
+            for fname in missing_files:
+                lats, lons = _tile_latlon(fname)
+                if lats is None:
+                    continue
+                label = _tile_label(fname)
+
+                if use_folium:
+                    folium.Polygon(
+                        locations=list(zip(lats, lons)),
+                        color='gray',
+                        fill=True,
+                        fill_color='gray',
+                        fill_opacity=0.35,
+                        weight=2,
+                        tooltip=label,
+                        popup=folium.Popup(fname)
+                    ).add_to(groupMissing)
+                    folium.Marker(
+                        location=[sum(lats[:-1])/4, sum(lons[:-1])/4],
+                        icon=folium.DivIcon(
+                            html='<div style="font-size:9px;color:#555;font-weight:bold;white-space:nowrap">%s</div>' % label,
+                            icon_size=(80, 20),
+                            icon_anchor=(40, 10)
+                        )
+                    ).add_to(groupMissing)
+                else:
+                    fig.add_trace(go.Scattermapbox(
+                        mode='lines',
+                        fill='toself',
+                        fillcolor='rgba(128,128,128,0.35)',
+                        line=dict(color='gray'),
+                        showlegend=False,
+                        lon=lons + [lons[0]],
+                        lat=lats + [lats[0]],
+                        hovertemplate=fname,
+                        name=label))
+
+            if use_folium:
+                groupMissing.add_to(m)
+
+        # Plot failed tiles (red — download error, not a server gap)
+        if failed_files:
+            if use_folium:
+                groupFailed = folium.FeatureGroup(name='<b>Failed tiles (download error)</b>')
+
+            for fname in failed_files:
+                lats, lons = _tile_latlon(fname)
+                if lats is None:
+                    continue
+                label = _tile_label(fname)
+
+                if use_folium:
+                    folium.Polygon(
+                        locations=list(zip(lats, lons)),
+                        color='red',
+                        fill=True,
+                        fill_color='red',
+                        fill_opacity=0.35,
+                        weight=2,
+                        tooltip=label,
+                        popup=folium.Popup(fname)
+                    ).add_to(groupFailed)
+                    folium.Marker(
+                        location=[sum(lats[:-1])/4, sum(lons[:-1])/4],
+                        icon=folium.DivIcon(
+                            html='<div style="font-size:9px;color:red;font-weight:bold;white-space:nowrap">%s</div>' % label,
+                            icon_size=(80, 20),
+                            icon_anchor=(40, 10)
+                        )
+                    ).add_to(groupFailed)
+                else:
+                    fig.add_trace(go.Scattermapbox(
+                        mode='lines',
+                        fill='toself',
+                        fillcolor='rgba(220,0,0,0.35)',
+                        line=dict(color='red'),
+                        showlegend=False,
+                        lon=lons + [lons[0]],
+                        lat=lats + [lats[0]],
+                        hovertemplate=fname,
+                        name=label))
+
+            if use_folium:
+                groupFailed.add_to(m)
+
         # Map finalisation
         if use_folium:
             minimap = plugins.MiniMap()
