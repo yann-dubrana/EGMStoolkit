@@ -130,11 +130,20 @@ def download_file(url,
 
             if response.status_code == 416:
                 usermessage.egmstoolkitprint('EGMS-Toolkit - Downloader - Download already done.',log,verbose)
+                return
 
             if (response.status_code == 502) and (bypass502 == True):
-                usermessage.egmstoolkitprint('The EGMS file does not exist.',log,verbose)
-                time.sleep(2)
-                return 
+                attempt += 1
+                if attempt >= retries:
+                    usermessage.egmstoolkitprint('The EGMS file does not exist (502 after %d attempts).' % retries, log, verbose)
+                    return
+                wait_time = retry_wait * (2 ** (attempt - 1))
+                usermessage.egmstoolkitprint(
+                    f'EGMS-toolkit - Downloader - 502 Bad Gateway. '
+                    f'Retrying in {wait_time}s (attempt {attempt}/{retries})',
+                    log, verbose
+                )
+                time.sleep(wait_time)
 
             response.raise_for_status() 
 

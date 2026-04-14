@@ -38,6 +38,9 @@ def _download_one_file(work_item, log, verbose_worker):
 
     Returns:
         tuple: (filename_label, success, error_msg)
+            success is True only when the output file exists after the call.
+            A 502 "file does not exist" response is treated as a non-fatal skip
+            (success=True, error_msg='skipped: file not available on server').
     """
     url_base, output_file_path, filename_label, token = work_item
     try:
@@ -48,9 +51,14 @@ def _download_one_file(work_item, log, verbose_worker):
             verbose=verbose_worker,
             log=log
         )
-        return (filename_label, True, None)
     except Exception as e:
         return (filename_label, False, str(e))
+
+    if not os.path.isfile(output_file_path):
+        # bypass502=True caused a silent return (server returned 502 / file not available)
+        return (filename_label, False, 'file not available on server (502)')
+
+    return (filename_label, True, None)
 
 ################################################################################
 ## Creation of a class to manage the Sentinel-1 burst ID map
@@ -397,12 +405,33 @@ class egmsdownloader:
                 for item in work_items
             )
 
+        not_available = []
+        failed = []
         for filename_label, success, error_msg in results:
             if not success:
-                usermessage.egmstoolkitprint(
-                    'Failed to download %s: %s' % (filename_label, error_msg),
-                    self.log, verbose
-                )
+                if error_msg and 'not available on server' in error_msg:
+                    not_available.append(filename_label)
+                    usermessage.egmstoolkitprint(
+                        'Skipped (not available on server): %s' % filename_label,
+                        self.log, verbose
+                    )
+                else:
+                    failed.append(filename_label)
+                    usermessage.egmstoolkitprint(
+                        'Failed to download %s: %s' % (filename_label, error_msg),
+                        self.log, verbose
+                    )
+
+        if not_available:
+            usermessage.egmstoolkitprint(
+                '%d file(s) not available on server: %s' % (len(not_available), ', '.join(not_available)),
+                self.log, verbose
+            )
+        if failed:
+            usermessage.egmstoolkitprint(
+                '%d file(s) failed to download (check log for details): %s' % (len(failed), ', '.join(failed)),
+                self.log, verbose
+            )
 
         self.unzipfile(
             outputdir=outputdir,
