@@ -175,7 +175,7 @@ def _download_one_file(work_item, log, verbose_worker, rate_limiter=None,
         """Yield (url, label) for primary and version-suffix alternates."""
         yield base_url, filename_label
         # Replace trailing version digit before .zip: _2019_2023_1.zip → _2019_2023_2.zip
-        for v in range(2, 10):
+        for v in range(2, 3):
             alt = re.sub(r'(_\d+)\.zip$', '_%d.zip' % v, base_url)
             if alt != base_url:
                 alt_label = re.sub(r'(_\d+)\.zip$', '_%d.zip' % v, filename_label)

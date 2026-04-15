@@ -3,3 +3,7 @@ __pycache__
 S1_burstid_20220530
 .vscode
 EGMStoolkit.egg-info
+data-EW
+data-UD
+.idea
+.venv
